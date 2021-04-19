@@ -1,122 +1,149 @@
-use yahoo_finance_api as yahoo;
-use clap::Clap;
+use async_std::prelude::*;
+use async_std::stream;
 use chrono::prelude::*;
+use clap::Clap;
+use std::time::Duration;
+use xactor::*;
+use yahoo_finance_api as yahoo;
+
+mod utils;
+
+use utils::{max, min, n_window_sma, price_diff, fetch_ticker_data};
 
 #[derive(Clap)]
 #[clap(
-    version = "1.0",
-    author = "Gene Kuo",
-    about = "Milestone 1: a simple tracker"
+  version = "1.0",
+  author = "Gene Kuo",
+  about = "Milestone 2: working with actors"
 )]
 struct Opts {
-    #[clap(short, long, default_value = "AAPL,MSFT,UBER,GOOG")]
-    symbols: String,
-    #[clap(short, long)]
-    from: String,
+  #[clap(short, long, default_value = "AAPL,MSFT,UBER,GOOG")]
+  symbols: String,
+  #[clap(short, long)]
+  from: String,
 }
 
-fn main() -> std::io::Result<()> {
-    let opts = Opts::parse();
+#[message]
+#[derive(Debug, Default, Clone)]
+struct Quotes {
+  pub symbol: String,
+  pub quotes: Vec<yahoo::Quote>,
+}
 
-    let from = opts.from.parse().expect("Can't parse from date");
+#[message]
+#[derive(Debug, Clone)]
+struct QuoteRequest {
+  symbol: String,
+  from: DateTime<Utc>,
+  to: DateTime<Utc>
+}
 
-    //let from = NaiveDate::parse_from_str(opts.from.as_str(), "%Y-%m-%d").unwrap();
-    //let from = DateTime::<Utc>::from_utc(from.and_hms(0, 0, 0), Utc);
-    //let end = Utc::now();
+#[derive(Default)]
+pub struct StockDataDownloader;
 
-    println!("period start,symbol,price,change %,min,max,30d avg");
-    for symbol in opts.symbols.split(",") {
-        let provider = yahoo::YahooConnector::new();
-        if let Ok(response) = provider.get_quote_history(symbol, from, Utc::now()) {
-            match response.quotes() {
-                Ok(mut quotes) => {
-                    if !quotes.is_empty() {
-                        quotes.sort_by_cached_key(|k| k.timestamp);
-                        let closes: Vec<f64> = quotes.iter().map(|q| q.adjclose as f64).collect();
-                        if !closes.is_empty() {
-                            let period_max: f64 = max(&closes).unwrap();
-                            let period_min: f64 = min(&closes).unwrap();
-                            let last_price = *closes.last().unwrap_or(&0.0);
-                            let (_, pct_change) = price_diff(&closes).unwrap_or((0.0, 0.0));
-                            let sma = n_window_sma(30, &closes).unwrap_or_default();
-                            println!(
-                                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                                from.to_rfc3339(),
-                                symbol,
-                                last_price,
-                                pct_change * 100.0,
-                                period_min,
-                                period_max,
-                                sma.last().unwrap_or(&0.0)
-                            );
-                        }
-                    }
-                }
-                _ => {
-                    eprint!("No quotes found for symbol '{}'", symbol);
-                }
-            }
-        } else {
-            eprint!("No quotes found for symbol '{}'", symbol);
+#[async_trait::async_trait]
+impl Handler<QuoteRequest> for StockDataDownloader {
+  async fn handle(&mut self, _ctx: &mut Context<Self>, msg: QuoteRequest) {
+    //println!("download");
+    let symbol = msg.symbol.clone();
+    // 1h interval works for larger time periods as well (months/years)
+    let data = match fetch_ticker_data(msg.symbol, msg.from, msg.to, String::from("1h")).await {
+      Ok(quotes) => Quotes {
+        symbol: symbol.clone(),
+        quotes,
+      },
+      Err(e) => {
+        eprintln!("Ignoring API error for symbol '{}': {}", symbol, e);
+        Quotes {
+          symbol: symbol.clone(),
+          quotes: vec![],
         }
+      }
+    };
+    if let Err(e) = Broker::from_registry().await.unwrap().publish(data) {
+      eprint!("{}", e);
     }
-    Ok(())
+  }
 }
 
-///
-/// Calculates the absolute and relative (price) change between the beginning and ending of an f64 series. 
-/// The relative (price) change is relative to the beginning.
-///
-/// # Returns
-///
-/// A tuple `(absolute, relative)` difference.
-///
-fn price_diff(a: &[f64]) -> Option<(f64, f64)> {
-    if !a.is_empty() {
-        let (first, last) = (a.first().unwrap(), a.last().unwrap());
-        let abs_diff = last - first;
-        let first = if *first == 0.0 { 1.0 } else { *first };
-        let rel_diff = abs_diff / first;
-        Some((abs_diff, rel_diff))
-    } else {
-        None
-    }
+
+#[async_trait::async_trait]
+impl Actor for StockDataDownloader {
+  async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+    //println!("downloader started");
+    ctx.subscribe::<QuoteRequest>().await
+    //Ok(())
+  }
 }
 
-///
-/// Find the maximum in a series of f64
-///
-fn max(series: &[f64]) -> Option<f64> {
-    if series.is_empty() {
-        None
-    } else {
-        Some(series.iter().fold(f64::MIN, |acc, q| acc.max(*q)))
+#[derive(Default)]
+struct StockDataProcessor;
+
+#[async_trait::async_trait]
+impl Handler<Quotes> for StockDataProcessor {
+  async fn handle(&mut self, _ctx: &mut Context<Self>, mut msg: Quotes) {
+    let data = msg.quotes.as_mut_slice();
+    if !data.is_empty() {
+
+      // ensure that the data is sorted by time (asc)
+      data.sort_by_cached_key(|k| k.timestamp);
+
+      let last_date = Utc.timestamp(data.last().unwrap().timestamp as i64, 0);
+
+      let close_prices: Vec<f64> = data.iter().map(|q| q.close).collect();
+      let last_price: f64 = *close_prices.last().unwrap();
+      let period_min = min(&close_prices).await.unwrap_or(0.0);
+      let period_max = max(&close_prices).await.unwrap_or(0.0);
+
+      let (_, pct_change) = price_diff(&close_prices).await.unwrap_or((0.0, 0.0));
+      let sma = n_window_sma(30, &close_prices).await.unwrap_or_default();
+      
+      println!(
+        "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+        last_date.to_rfc3339(), msg.symbol, last_price, pct_change * 100.0, period_min, period_max, sma.last().unwrap_or(&0.0)
+      );
     }
+  }
 }
 
-///
-/// Find the minimum in a series of f64
-///
-fn min(series: &[f64]) -> Option<f64> {
-    if series.is_empty() {
-        None
-    } else {
-        Some(series.iter().fold(f64::MAX, |acc, q| acc.min(*q)))
-    }
+#[async_trait::async_trait]
+impl Actor for StockDataProcessor {
+  async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+    //println!("processor started");
+    ctx.subscribe::<Quotes>().await
+    //Ok(())
+  }
 }
 
-///
-/// Window function to create a simple moving average
-///
-fn n_window_sma(n: usize, series: &[f64]) -> Option<Vec<f64>> {
-    if !series.is_empty() && n > 1 {
-        Some(
-            series
-                .windows(n)
-                .map(|w| w.iter().sum::<f64>() / w.len() as f64)
-                .collect(),
-        )
-    } else {
-        None
+#[xactor::main]
+async fn main() -> Result<()> {
+  let opts: Opts = Opts::parse();
+  let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
+  let symbols: Vec<String> = opts.symbols.split(',').map(|s| s.to_owned()).collect();
+
+  // Start actors
+  let _downloader = Supervisor::start(|| StockDataDownloader).await?;
+  let _processor = Supervisor::start(|| StockDataProcessor).await?;
+  //let _ = downloader.join(processor).await;
+  //let _addr1 = StockDataDownloader::start_default().await?;
+  //let _addr2 = StockDataProcessor::start_default().await?;
+
+  // CSV header
+  println!("period start,symbol,price,change %,min,max,30d avg");
+  let mut interval = stream::interval(Duration::from_secs(10));
+  'outer: while interval.next().await.is_some() {
+    //println!("interval");
+    let now = Utc::now(); // Period end for this fetch
+    for symbol in &symbols {
+      if let Err(e) = Broker::from_registry().await?.publish(QuoteRequest {
+        symbol: symbol.clone(),
+        from,
+        to: now 
+      }) {
+        eprint!("{}", e);
+        break 'outer;
+      }
     }
+  }
+  Ok(())
 }
